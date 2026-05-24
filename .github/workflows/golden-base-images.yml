@@ -1,15 +1,12 @@
 name: Build Golden Base Images
 
 on:
-  # ── Manual trigger with optional single-version override ──────────────────
   workflow_dispatch:
     inputs:
       ruby_version:
         description: "Build a single Ruby version (leave blank for all)"
         required: false
         default: ""
-
-  # ── Rebuild on changes to the golden Dockerfile ───────────────────────────
   push:
     branches:
       - main
@@ -17,39 +14,27 @@ on:
       - "Dockerfile.golden"
       - ".github/workflows/golden-base-images.yml"
 
-# ── Permissions — GITHUB_TOKEN needs package write for GHCR push ─────────────
 permissions:
   contents: read
-  packages: write           # push to ghcr.io
-  security-events: write    # upload Trivy SARIF to GitHub Security tab
+  packages: write
+  security-events: write
 
-# Cancel in-progress runs on the same branch (saves CI minutes)
 concurrency:
   group: golden-base-${{ github.ref }}
   cancel-in-progress: true
 
-# =============================================================================
-# ▼▼▼  UPDATE THIS LIST TO ADD / REMOVE RUBY VERSIONS  ▼▼▼
-# =============================================================================
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}/rails-golden
   RUBY_VERSIONS: >-
-    3.2.8
-    3.3.6
     3.4.4
-# =============================================================================
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # 1. Compute the matrix from RUBY_VERSIONS (or the manual override)
-  # ---------------------------------------------------------------------------
   prepare-matrix:
     name: Prepare version matrix
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
-
     steps:
       - name: Build version matrix JSON
         id: set-matrix
@@ -65,36 +50,27 @@ jobs:
           fi
           echo "matrix={\"ruby_version\":${VERSIONS}}" >> "$GITHUB_OUTPUT"
 
-  # ---------------------------------------------------------------------------
-  # 2. Build → Scan → Push  (one job per Ruby version, runs in parallel)
-  # ---------------------------------------------------------------------------
   build-golden:
     name: "Golden image • Ruby ${{ matrix.ruby_version }}"
     needs: prepare-matrix
-    runs-on: ubuntu-latest          # swap to ubuntu-latest-arm64 / self-hosted
-                                    # Graviton runner to remove QEMU overhead
+    runs-on: ubuntu-latest
     strategy:
-      fail-fast: false              # don't cancel sibling jobs if one version fails
+      fail-fast: false
       matrix: ${{ fromJSON(needs.prepare-matrix.outputs.matrix) }}
-
     steps:
-      # ── Checkout ────────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── QEMU — needed to build ARM64 on x86 runners ──────────────────────
       - name: Set up QEMU (ARM64 emulation)
         uses: docker/setup-qemu-action@v3
         with:
           platforms: arm64
 
-      # ── Buildx — multi-platform builder with layer cache support ─────────
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
           platforms: linux/arm64
 
-      # ── Login to GHCR (uses built-in GITHUB_TOKEN — no secrets needed) ───
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -102,21 +78,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── Metadata / tags ──────────────────────────────────────────────────
       - name: Generate image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            # Exact version tag  →  rails-golden:3.3.6
-            type=raw,value=${{ matrix.ruby_version }}
-            # Minor-pinned tag   →  rails-golden:3.3  (floats to latest patch)
-            type=raw,value=${{ join(slice(split(matrix.ruby_version, '.'), 0, 2), '.') }}
-            # Major-pinned tag   →  rails-golden:3    (floats to latest minor)
-            type=raw,value=${{ split(matrix.ruby_version, '.')[0] }}
+            type=semver,pattern={{version}},value=${{ matrix.ruby_version }}
+            type=semver,pattern={{minor}},value=${{ matrix.ruby_version }}
+            type=semver,pattern={{major}},value=${{ matrix.ruby_version }}
 
-      # ── Build (load locally for Trivy scan, don't push yet) ─────────────
       - name: Build golden image
         id: build
         uses: docker/build-push-action@v6
@@ -124,8 +95,7 @@ jobs:
           context: .
           file: Dockerfile.golden
           platforms: linux/arm64
-          push: false                 # push only after Trivy passes
-          load: true                  # load into local daemon for scanning
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
@@ -133,9 +103,8 @@ jobs:
             BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
             VCS_REF=${{ github.sha }}
           cache-from: type=gha,scope=golden-${{ matrix.ruby_version }}
-          cache-to:   type=gha,scope=golden-${{ matrix.ruby_version }},mode=max
+          cache-to: type=gha,scope=golden-${{ matrix.ruby_version }},mode=max
 
-      # ── Trivy vulnerability scan ──────────────────────────────────────────
       - name: Run Trivy vulnerability scan
         id: trivy
         uses: aquasecurity/trivy-action@master
@@ -144,13 +113,12 @@ jobs:
           format: "sarif"
           output: "trivy-results-${{ matrix.ruby_version }}.sarif"
           severity: "CRITICAL,HIGH"
-          exit-code: "1"              # fails the job if CRITICAL/HIGH CVEs found
-          ignore-unfixed: true        # unfixed = no patch available; don't block
+          exit-code: "1"
+          ignore-unfixed: true
           vuln-type: "os,library"
           scanners: "vuln,secret,misconfig"
           timeout: "10m"
 
-      # ── Upload SARIF to GitHub Security tab (runs even on scan failure) ──
       - name: Upload Trivy SARIF
         if: always()
         uses: github/codeql-action/upload-sarif@v3
@@ -158,17 +126,12 @@ jobs:
           sarif_file: "trivy-results-${{ matrix.ruby_version }}.sarif"
           category: "trivy-golden-ruby-${{ matrix.ruby_version }}"
 
-      # ── Notify on scan failure ────────────────────────────────────────────
       - name: Notify on scan failure
         if: failure() && steps.trivy.outcome == 'failure'
         run: |
           echo "::error::Trivy found CRITICAL/HIGH CVEs in Ruby ${{ matrix.ruby_version }} golden image."
           echo "Check the Security tab for the full SARIF report."
-          # Add your Slack/webhook notification here if needed
 
-  # ---------------------------------------------------------------------------
-  # 3. Summary job — gates downstream pipelines on ALL versions passing
-  # ---------------------------------------------------------------------------
   all-golden-images-ready:
     name: All golden images ready
     needs: build-golden
