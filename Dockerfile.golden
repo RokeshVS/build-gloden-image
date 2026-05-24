@@ -10,6 +10,7 @@ FROM debian:${DEBIAN_VERSION} AS ruby-build
 
 ARG RUBY_VERSION
 
+# Added rustc and cargo for native YJIT compilation support
 RUN set -eux; \
     apt-get update -qq; \
     apt-get install -y --no-install-recommends \
@@ -24,20 +25,23 @@ RUN set -eux; \
         libssl-dev \
         libyaml-dev \
         zlib1g-dev \
-        pkg-config; \
+        pkg-config \
+        rustc \
+        cargo; \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
-# Clone ruby-build safely to compile the requested Ruby version
 RUN git clone --depth 1 https://github.com/rbenv/ruby-build.git /tmp/ruby-build \
  && PREFIX=/usr/local /tmp/ruby-build/install.sh \
  && rm -rf /tmp/ruby-build
 
-# Compile Ruby with explicit optimization flags (YJIT, clean docs)
-ENV RUBY_CONFIGURE_OPTS="--enable-yjit --disable-install-doc"
+# MAKEFLAGS="-j2" limits parallel compilation jobs so the QEMU emulator doesn't thrash/crash
+# CFLAGS optimizes compilation speed over micro-performance during image setup
+ENV MAKEFLAGS="-j2" \
+    CFLAGS="-O2 -pipe" \
+    RUBY_CONFIGURE_OPTS="--enable-yjit --disable-install-doc"
 
 RUN ruby-build ${RUBY_VERSION} /usr/local/ruby
 
-# Strip the binary to reduce overall image size footprint
 RUN strip --strip-unneeded /usr/local/ruby/bin/ruby || true
 
 # =============================================================================
