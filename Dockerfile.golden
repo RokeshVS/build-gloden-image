@@ -1,0 +1,106 @@
+# syntax=docker/dockerfile:1.7
+
+ARG RUBY_VERSION
+ARG DEBIAN_VERSION=12-slim
+
+# =============================================================================
+# STAGE 1 — rvm-build
+# Installs RVM, compiles Ruby from source, then discarded entirely.
+# =============================================================================
+FROM debian:${DEBIAN_VERSION} AS rvm-build
+
+ARG RUBY_VERSION
+
+SHELL ["/bin/bash", "-l", "-c"]
+
+RUN set -eux; \
+    apt-get update -qq; \
+    apt-get install -y --no-install-recommends \
+        bash \
+        build-essential \
+        ca-certificates \
+        curl \
+        git \
+        gnupg2 \
+        libffi-dev \
+        libgdbm-dev \
+        libncurses5-dev \
+        libreadline-dev \
+        libssl-dev \
+        libyaml-dev \
+        libz-dev \
+        pkg-config \
+        procps \
+        zlib1g-dev; \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+
+RUN curl -sSL https://rvm.io/mpapis.asc | gpg2 --import - \
+ && curl -sSL https://rvm.io/pkuczynski.asc | gpg2 --import -
+
+RUN curl -sSL https://get.rvm.io | bash -s stable --without-gems="rvm"
+
+RUN rvm install ${RUBY_VERSION} \
+        --disable-binary \
+        --with-configure-flags="--enable-yjit --disable-install-doc" \
+ && rvm use ${RUBY_VERSION} --default \
+ && rvm cleanup all
+
+RUN strip --strip-unneeded \
+        /usr/local/rvm/rubies/ruby-${RUBY_VERSION}/bin/ruby || true
+
+# =============================================================================
+# STAGE 2 — base (golden runtime)
+# Clean Debian 12 slim with only the compiled Ruby copied across.
+# =============================================================================
+FROM debian:${DEBIAN_VERSION} AS base
+
+ARG RUBY_VERSION
+ARG BUILD_DATE
+ARG VCS_REF
+
+LABEL org.opencontainers.image.title="rails-golden" \
+      org.opencontainers.image.description="Hardened golden base for Ruby on Rails (ARM64)" \
+      org.opencontainers.image.base.name="debian:12-slim" \
+      org.opencontainers.image.version="${RUBY_VERSION}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.source="https://github.com/<ORG>/<REPO>"
+
+COPY --from=rvm-build /usr/local/rvm/rubies/ruby-${RUBY_VERSION} \
+                      /usr/local/rvm/rubies/ruby-${RUBY_VERSION}
+COPY --from=rvm-build /usr/local/rvm/gems/ruby-${RUBY_VERSION} \
+                      /usr/local/rvm/gems/ruby-${RUBY_VERSION}
+COPY --from=rvm-build /usr/local/rvm/gems/ruby-${RUBY_VERSION}@global \
+                      /usr/local/rvm/gems/ruby-${RUBY_VERSION}@global
+
+ENV BUNDLE_DEPLOYMENT="1" \
+    BUNDLE_PATH="/usr/local/bundle" \
+    GEM_HOME="/usr/local/bundle" \
+    PATH="/usr/local/bundle/bin:/usr/local/rvm/rubies/ruby-${RUBY_VERSION}/bin:/usr/local/rvm/gems/ruby-${RUBY_VERSION}/bin:$PATH"
+
+RUN set -eux; \
+    apt-get update -qq; \
+    apt-get upgrade -y --no-install-recommends; \
+    apt-get install -y --no-install-recommends \
+        libjemalloc2 \
+        libvips42 \
+        libpq5 \
+        libsqlite3-0 \
+        libyaml-0-2 \
+        libssl3 \
+        zlib1g \
+        ca-certificates \
+        tzdata \
+        curl; \
+    apt-get autoremove -y; \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /tmp/* /var/tmp/*
+
+RUN groupadd --system --gid 1001 rails \
+ && useradd  --system --uid 1001 --gid 1001 \
+             --no-create-home --shell /sbin/nologin rails
+
+WORKDIR /rails
+
+RUN chown rails:rails /rails
+
+USER 1001:1001
